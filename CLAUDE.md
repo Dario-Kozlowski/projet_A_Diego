@@ -2123,15 +2123,84 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 4
 3. **Respecte l'architecture** - UI → EventBus → Controller → Unit
 4. **Jamais de spaghetti** - L'UI n'appelle jamais les unités directement
 
-### Ordre de Développement
+### ⛔ ZONE INTERDITE - NE PAS TOUCHER
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  🚫 CONTENU DU JEU = INTERDIT DE MODIFIER                       │
+│  ─────────────────────────────────────────────────────────────  │
+│                                                                 │
+│  ❌ Peuples (races, factions)                                   │
+│  ❌ Champions (noms, designs, lore)                             │
+│  ❌ Abilities (compétences, effets, descriptions)               │
+│  ❌ Stats (HP, ATK, DEF, vitesse, portée)                       │
+│  ❌ Équilibrage (dégâts, coûts, cooldowns)                      │
+│                                                                 │
+│  💡 Le game design est géré par l'humain, pas par l'IA          │
+│  💡 Claude Code = technique UNIQUEMENT                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 🚨 PRIORITÉ IMMÉDIATE - ORDRE OBLIGATOIRE
+
+**Claude Code DOIT suivre cet ordre exact :**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 1 : 🐛 BUGS CRITIQUES (BLOCKERS)                        │
+│  ─────────────────────────────────────────────────────────────  │
+│  📄 Lire : AUDIT_FIXES_PROMPT.md                                │
+│                                                                 │
+│  Bug #1 : Game Over chain brisée                                │
+│    → unit_died non connecté dans TurnManager                    │
+│    → Mort du Leader = rien ne se passe                          │
+│                                                                 │
+│  Bug #2 : UI input passthrough                                  │
+│    → Clics traversent les panels UI                             │
+│    → Actions involontaires sur les unités                       │
+│                                                                 │
+│  ⚠️ SANS CES FIXES, LE JEU EST INJOUABLE                        │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 2 : 🔌 MULTIJOUEUR P2P LOCAL (RPC)                       │
+│  ─────────────────────────────────────────────────────────────  │
+│  📄 Section : Multiplayer P2P RPC Security (ci-dessus)          │
+│                                                                 │
+│  → ENet avec Godot High-Level Multiplayer                       │
+│  → RPCs "call_local" pour synchronisation                       │
+│  → Validation serveur-side (host = autorité)                    │
+│  → Fonctionne sur réseau local SANS serveur                     │
+│                                                                 │
+│  ✅ Permet de tester le jeu à 2 rapidement                      │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 3 : 🖥️ BACKEND PYTHON (OPTIONNEL - ONLINE)              │
+│  ─────────────────────────────────────────────────────────────  │
+│  📄 Section : Backend Multiplayer Online (ci-dessus)            │
+│                                                                 │
+│  → FastAPI + WebSocket                                          │
+│  → Serveur autoritaire pour matchmaking online                  │
+│  → Anti-cheat renforcé                                          │
+│                                                                 │
+│  ⏳ À faire APRÈS que P2P fonctionne                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Ordre de Développement Global
 ```
 1. ✅ Moteur (FAIT - ne plus toucher)
-2. 🔄 HUD & Game Over
-3. ⏳ Peuples (Data .tres)
-4. ⏳ Compétences uniques
-5. ⏳ IA basique (si PvE)
-6. ⏳ Backend Multijoueur (spec ci-dessus)
-7. ⏳ Intégration Godot ↔ Backend
+2. 🚨 BUGS CRITIQUES (AUDIT_FIXES_PROMPT.md) ← FAIRE EN PREMIER
+3. 🔌 Multiplayer P2P RPC (réseau local)
+4. ⏳ Peuples (Data .tres)
+5. ⏳ Compétences uniques
+6. ⏳ IA basique (si PvE)
+7. ⏳ Backend Python Online (optionnel)
+8. ⏳ Intégration Godot ↔ Backend
 ```
 
 ### Format de Réponse Préféré
