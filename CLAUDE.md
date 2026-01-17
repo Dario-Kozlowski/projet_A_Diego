@@ -405,6 +405,219 @@ func _unhandled_input(event: InputEvent) -> void:
 
 ---
 
+## 🔬 STRESS TEST : AOE & Victoire
+
+### Scénario de Test Automatisé
+```gdscript
+# res://scripts/main.gd - Ajout temporaire dans _ready()
+func _ready():
+    # === STRESS TEST SETUP ===
+    EventBus.game_ended.connect(_on_game_ended_test)
+    
+    # Créer les unités de test
+    var mage = _spawn_unit(Vector2i(2, 2), 0, false, preload("res://resources/abilities/fireball.tres"))
+    var garde = _spawn_unit(Vector2i(2, 4), 1, false)  # 2 cases sous le mage
+    var roi = _spawn_unit(Vector2i(3, 4), 1, true)     # Leader, à droite du garde
+    
+    # Simuler l'attaque après 1 seconde
+    await get_tree().create_timer(1.0).timeout
+    _run_aoe_test(mage, Vector2i(2, 4))
+
+func _run_aoe_test(caster: UnitBase, target_cell: Vector2i):
+    var ability = caster.abilities[0] as AbilityFireball
+    var pattern = ability.get_target_pattern(target_cell)
+    
+    print("🎯 Pattern AOE: ", pattern)
+    # Attendu: [2,4], [1,4], [3,4], [2,3], [2,5]
+    
+    # Trouver les unités dans la zone
+    var targets: Array[UnitBase] = []
+    for cell in pattern:
+        var unit = game_board.get_unit_at(cell)
+        if unit:
+            print("  → Touché: %s en %s (HP: %d)" % [unit.name, cell, unit.current_hp])
+            targets.append(unit)
+    
+    # Exécuter l'attaque
+    ability.execute(caster, targets)
+    
+    await ability.execution_finished
+    for t in targets:
+        if is_instance_valid(t):
+            print("  → %s HP après: %d" % [t.name, t.current_hp])
+
+func _on_game_ended_test(winner: int):
+    print("🏆 VICTOIRE DÉTECTÉE - Team %d gagne !" % winner)
+```
+
+### Résultats Attendus
+| Vérification | Résultat Attendu |
+|--------------|------------------|
+| Pattern affiché | `[(2,4), (1,4), (3,4), (2,3), (2,5)]` |
+| Garde touché | Oui (centre de la croix) |
+| Roi touché | Oui (droite de la croix) |
+| Signal `game_ended` | Émis si Roi meurt (is_leader) |
+
+---
+
+## 🗺️ FEUILLE DE ROUTE (Prochaines Étapes)
+
+### ⚠️ STOP : Ne plus toucher au moteur après validation du Stress Test
+
+---
+
+### 📊 Étape 1 : HUD & Interface (Priorité Haute)
+
+**Objectif :** Remplacer les `print()` par une vraie UI
+
+#### Barre de Vie (HealthBar)
+```gdscript
+# res://scripts/ui/health_bar.gd
+extends TextureProgressBar
+
+@export var unit: UnitBase
+
+func _ready():
+    if unit:
+        unit.hp_changed.connect(_update_bar)
+        _update_bar(unit.current_hp, unit.stats.max_hp)
+
+func _update_bar(current: int, max_val: int):
+    max_value = max_val
+    value = current
+```
+
+#### Panneau Game Over
+```gdscript
+# res://scripts/ui/game_over_panel.gd
+extends CanvasLayer
+
+@onready var label: Label = $Panel/Label
+@onready var replay_btn: Button = $Panel/ReplayButton
+
+func _ready():
+    visible = false
+    EventBus.game_ended.connect(_show_game_over)
+    replay_btn.pressed.connect(_on_replay)
+
+func _show_game_over(winner: int):
+    label.text = "Team %d Wins!" % winner
+    visible = true
+    get_tree().paused = true
+
+func _on_replay():
+    get_tree().paused = false
+    get_tree().reload_current_scene()
+```
+
+---
+
+### 🎭 Étape 2 : Création des Peuples (Data)
+
+**Conseil :** Utiliser un tableur pour l'équilibrage, puis générer les `.tres`
+
+#### Template de Champion
+```
+res://resources/champions/
+├── feu/
+│   ├── mage_feu_stats.tres
+│   └── guerrier_feu_stats.tres
+├── temps/
+│   ├── oracle_stats.tres
+│   └── gardien_temps_stats.tres
+└── ...
+```
+
+#### Équilibrage Suggéré
+| Peuple | HP | PA | Move | Atk | Def | Spécialité |
+|--------|----|----|------|-----|-----|------------|
+| 🔥 Feu | 8 | 3 | 3 | 5 | 1 | Dégâts AOE |
+| ⏰ Temps | 10 | 4 | 4 | 2 | 2 | Contrôle |
+| 🌿 Nature | 12 | 3 | 3 | 3 | 3 | Sustain |
+| ⚡ Foudre | 6 | 3 | 5 | 4 | 1 | Mobilité |
+| 🪨 Terre | 15 | 2 | 2 | 3 | 5 | Tank |
+
+---
+
+### ⚔️ Étape 3 : Compétences Uniques
+
+#### Peuple du Temps - Rembobinage
+```gdscript
+# res://scripts/abilities/ability_rewind.gd
+extends AbilityBase
+class_name AbilityRewind
+
+var position_history: Dictionary = {}  # unit_id -> last_position
+
+func execute(caster: UnitBase, target: UnitBase) -> void:
+    if position_history.has(target.get_instance_id()):
+        var old_pos = position_history[target.get_instance_id()]
+        target.teleport_to(old_pos)
+        target.current_hp = min(target.current_hp + 3, target.stats.max_hp)
+    await caster.get_tree().process_frame
+    execution_finished.emit()
+```
+
+#### Peuple de la Terre - Mur
+```gdscript
+# res://scripts/abilities/ability_wall.gd
+extends AbilityBase
+class_name AbilityWall
+
+func get_target_pattern(center: Vector2i) -> Array[Vector2i]:
+    return [center]  # Une seule case
+
+func execute(caster: UnitBase, target_cell: Vector2i) -> void:
+    GameBoard.set_cell_walkable(target_cell, false)
+    # Spawner un sprite de mur
+    var wall = preload("res://scenes/wall.tscn").instantiate()
+    wall.position = GameBoard.cell_to_world(target_cell)
+    caster.get_tree().root.add_child(wall)
+    await caster.get_tree().process_frame
+    execution_finished.emit()
+```
+
+---
+
+### 🤖 Étape 4 : Intelligence Artificielle
+
+#### AIController Basique
+```gdscript
+# res://scripts/controllers/ai_controller.gd
+extends Node
+class_name AIController
+
+func play_turn(units: Array[UnitBase], game_board: GameBoard) -> void:
+    for unit in units:
+        if unit.current_ap <= 0:
+            continue
+        
+        var action = _decide_action(unit, game_board)
+        await _execute_action(unit, action)
+
+func _decide_action(unit: UnitBase, board: GameBoard) -> Dictionary:
+    var enemies = _get_enemies(unit)
+    var leader = _find_enemy_leader(enemies)
+    
+    # Priorité 1: Tuer le leader si possible
+    if leader and _can_attack(unit, leader):
+        return {type = "attack", target = leader}
+    
+    # Priorité 2: Tuer l'ennemi le plus faible
+    var weakest = _find_weakest(enemies)
+    if weakest and _can_attack(unit, weakest):
+        return {type = "attack", target = weakest}
+    
+    # Priorité 3: Se rapprocher
+    var closest = _find_closest(unit, enemies)
+    if closest:
+        return {type = "move", target = _get_closest_cell(unit, closest)}
+    
+    return {type = "end_turn"}
+```
+
+---
+
 ## 🎭 Peuples et Compétences (PROCHAINE ÉTAPE)
 
 ### Peuples Prévus
@@ -425,6 +638,15 @@ func _unhandled_input(event: InputEvent) -> void:
 2. **Code d'abord** - Génère le code, explique après si demandé
 3. **Respecte l'architecture** - UI → EventBus → Controller → Unit
 4. **Jamais de spaghetti** - L'UI n'appelle jamais les unités directement
+
+### Ordre de Développement
+```
+1. ✅ Moteur (FAIT - ne plus toucher)
+2. 🔄 HUD & Game Over
+3. ⏳ Peuples (Data .tres)
+4. ⏳ Compétences uniques
+5. ⏳ IA basique
+```
 
 ### Format de Réponse Préféré
 ```
