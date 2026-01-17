@@ -913,27 +913,541 @@ func _execute_move(unit_path: NodePath, target_cell: Vector2i):
 
 ---
 
-### 🔄 Flux de Données Réseau
+## 🔒 FINALISATION MULTIJOUEUR P2P (SÉCURITÉ & RPC)
+
+> **Contexte :** Le Lobby fonctionne (Host/Join). NetworkManager existe.
+> **Objectif :** Sécuriser les inputs (chacun son tour) et synchroniser TOUTES les actions sur tous les écrans.
+
+---
+
+### 📋 Vue d'Ensemble du Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    FLOW RÉSEAU SÉCURISÉ                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  [JOUEUR CLIQUE]                                                        │
+│       │                                                                 │
+│       ▼                                                                 │
+│  ┌─────────────────┐                                                    │
+│  │ PlayerController │                                                   │
+│  │ Guard Clauses:   │                                                   │
+│  │ - is_my_turn()?  │ ──NO──► return (ignore input)                    │
+│  │ - is_my_unit()?  │                                                   │
+│  └────────┬────────┘                                                    │
+│           │ YES                                                         │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ RPC Request     │ ─────► rpc_request_move.rpc(...)                  │
+│  └────────┬────────┘        (envoi à TOUS via call_local)              │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────────────────────────────────────────────────┐       │
+│  │                    TOUS LES PEERS                            │       │
+│  │  ┌──────────────┐     ┌──────────────┐                      │       │
+│  │  │    HOST      │     │   CLIENT     │                      │       │
+│  │  │ (Authority)  │     │              │                      │       │
+│  │  │              │     │              │                      │       │
+│  │  │ 1. Valide    │     │ 1. Reçoit    │                      │       │
+│  │  │ 2. Exécute   │     │ 2. Exécute   │                      │       │
+│  │  │ 3. Broadcast │     │    (sync)    │                      │       │
+│  │  └──────────────┘     └──────────────┘                      │       │
+│  └─────────────────────────────────────────────────────────────┘       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 🎯 Tâche 1 : Identification Joueur (network_manager.gd)
+
+**Fichier :** `res://autoload/network_manager.gd`
+
+**Variables à ajouter :**
+```gdscript
+## Identification du joueur local
+var my_player_id: int = 0  # 0 = Local, 1 = Host, X = Client (peer ID)
+
+## Mapping peer_id -> team_index
+## Host (ID 1) = Team 0, Premier Client = Team 1
+var player_teams: Dictionary = {}  # { peer_id: team_index }
+
+## Constantes
+const TEAM_HOST: int = 0
+const TEAM_CLIENT: int = 1
+const LOCAL_PLAYER_ID: int = 0
+```
+
+**Fonction d'identification :**
+```gdscript
+## Détermine si c'est le tour du joueur local
+## @param active_team_index: L'index de l'équipe dont c'est le tour (depuis TurnManager)
+## @return: true si c'est MON tour
+func is_my_turn(active_team_index: int) -> bool:
+    # Mode Local (pas de connexion réseau) → Toujours mon tour
+    if not multiplayer.has_multiplayer_peer():
+        return true
+    
+    # Mode Réseau → Vérifier si ma team correspond
+    var my_team = player_teams.get(my_player_id, -1)
+    return my_team == active_team_index
+
+## Détermine si une unité m'appartient
+## @param unit: L'unité à vérifier
+## @return: true si c'est MON unité
+func is_my_unit(unit: UnitBase) -> bool:
+    # Mode Local → Toutes les unités de l'équipe active
+    if not multiplayer.has_multiplayer_peer():
+        return unit.team_index == TurnManager.current_team
+    
+    # Mode Réseau → Vérifier ownership
+    var my_team = player_teams.get(my_player_id, -1)
+    return unit.team_index == my_team
+
+## Récupérer ma team
+func get_my_team() -> int:
+    if not multiplayer.has_multiplayer_peer():
+        return TurnManager.current_team  # Local: team active
+    return player_teams.get(my_player_id, -1)
+```
+
+**Initialisation au moment de la connexion :**
+```gdscript
+func _on_server_created():
+    my_player_id = 1  # Host = ID 1
+    player_teams[1] = TEAM_HOST  # Host = Team 0
+    print("🖥️ Host démarré (ID: 1, Team: 0)")
+
+func _on_connected_to_server():
+    my_player_id = multiplayer.get_unique_id()
+    print("🎮 Connecté au serveur (ID: %d)" % my_player_id)
+
+func _on_peer_connected(id: int):
+    if multiplayer.is_server():
+        # Assigner Team 1 au premier client
+        player_teams[id] = TEAM_CLIENT
+        print("👤 Client %d assigné à Team %d" % [id, TEAM_CLIENT])
+        
+        # Synchroniser les teams sur tous les clients
+        _sync_teams.rpc()
+
+@rpc("authority", "call_local", "reliable")
+func _sync_teams():
+    if multiplayer.is_server():
+        # Envoyer le dictionnaire complet
+        _receive_teams.rpc(player_teams)
+
+@rpc("any_peer", "reliable")
+func _receive_teams(teams: Dictionary):
+    player_teams = teams
+    print("📋 Teams synchronisées: %s" % str(player_teams))
+```
+
+---
+
+### 🎯 Tâche 2 : Sécuriser l'Input (player_controller.gd)
+
+**Fichier :** `res://scripts/controllers/player_controller.gd`
+
+**Guard Clauses au début de _unhandled_input :**
+```gdscript
+func _unhandled_input(event: InputEvent) -> void:
+    # ═══════════════════════════════════════════════════════════════
+    # GUARD CLAUSE 1: Vérifier si c'est mon tour
+    # ═══════════════════════════════════════════════════════════════
+    if not NetworkManager.is_my_turn(TurnManager.current_team):
+        return  # Pas mon tour → Ignorer tout input
+    
+    # ═══════════════════════════════════════════════════════════════
+    # GUARD CLAUSE 2: Ignorer si partie terminée ou UI bloquée
+    # ═══════════════════════════════════════════════════════════════
+    if TurnManager.is_game_over or _is_ui_blocking:
+        return
+    
+    # ... reste du code existant (traitement du clic) ...
+```
+
+**Vérification avant action sur unité :**
+```gdscript
+func _on_cell_clicked(cell: Vector2i) -> void:
+    var unit = GridManager.get_unit_at(cell)
+    
+    if unit:
+        # ═══════════════════════════════════════════════════════════
+        # GUARD: Vérifier que c'est MON unité
+        # ═══════════════════════════════════════════════════════════
+        if not NetworkManager.is_my_unit(unit):
+            print("⚠️ Ce n'est pas mon unité!")
+            return
+        
+        _select_unit(unit)
+    else:
+        # Clic sur case vide...
+```
+
+---
+
+### 🎯 Tâche 3 : Synchronisation RPC des Actions
+
+**Fichier :** `res://scripts/controllers/player_controller.gd`
+
+**Principe du "call_local" :**
+```
+@rpc("call_local") signifie:
+- J'exécute la fonction chez MOI immédiatement
+- ET j'envoie l'appel à tous les autres peers
+- Résultat: TOUT LE MONDE exécute le même code, synchronisé
+```
+
+**Déclaration des fonctions RPC :**
+```gdscript
+# ═══════════════════════════════════════════════════════════════════════════
+#                           RPC FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+## RPC: Demande de mouvement
+## @rpc("call_local"): Exécute ici ET envoie aux autres
+## @rpc("reliable"): Garantit la livraison (TCP-like)
+## @rpc("any_peer"): N'importe qui peut appeler (pas juste le serveur)
+@rpc("call_local", "reliable", "any_peer")
+func rpc_request_move(unit_path: NodePath, target_cell_x: int, target_cell_y: int) -> void:
+    var unit = get_node_or_null(unit_path) as UnitBase
+    if not unit:
+        push_error("RPC Move: Unité introuvable: %s" % unit_path)
+        return
+    
+    var target_cell = Vector2i(target_cell_x, target_cell_y)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # VALIDATION SERVEUR (Anti-triche)
+    # ═══════════════════════════════════════════════════════════════
+    if multiplayer.is_server():
+        var sender_id = multiplayer.get_remote_sender_id()
+        # sender_id == 0 si c'est nous-mêmes (call_local)
+        if sender_id != 0 and not _validate_action(sender_id, unit):
+            push_warning("⚠️ Action rejetée: Joueur %d ne peut pas contrôler cette unité" % sender_id)
+            return
+    
+    # Émettre le signal EventBus → La logique existante s'exécute
+    EventBus.move_requested.emit(unit, target_cell)
+
+
+## RPC: Demande d'attaque
+@rpc("call_local", "reliable", "any_peer")
+func rpc_request_attack(attacker_path: NodePath, target_path: NodePath) -> void:
+    var attacker = get_node_or_null(attacker_path) as UnitBase
+    var target = get_node_or_null(target_path) as UnitBase
+    
+    if not attacker or not target:
+        push_error("RPC Attack: Unité introuvable")
+        return
+    
+    # Validation serveur
+    if multiplayer.is_server():
+        var sender_id = multiplayer.get_remote_sender_id()
+        if sender_id != 0 and not _validate_action(sender_id, attacker):
+            push_warning("⚠️ Attaque rejetée: Joueur %d" % sender_id)
+            return
+    
+    EventBus.attack_requested.emit(attacker, target)
+
+
+## RPC: Demande d'utilisation de compétence
+@rpc("call_local", "reliable", "any_peer")
+func rpc_request_ability(caster_path: NodePath, ability_id: String, target_x: int, target_y: int) -> void:
+    var caster = get_node_or_null(caster_path) as UnitBase
+    if not caster:
+        push_error("RPC Ability: Caster introuvable")
+        return
+    
+    var target_cell = Vector2i(target_x, target_y)
+    
+    # Validation serveur
+    if multiplayer.is_server():
+        var sender_id = multiplayer.get_remote_sender_id()
+        if sender_id != 0 and not _validate_action(sender_id, caster):
+            push_warning("⚠️ Compétence rejetée: Joueur %d" % sender_id)
+            return
+    
+    EventBus.ability_requested.emit(caster, ability_id, target_cell)
+
+
+## RPC: Fin de tour
+@rpc("call_local", "reliable", "any_peer")
+func rpc_end_turn() -> void:
+    # Validation: Seul le joueur actif peut terminer le tour
+    if multiplayer.is_server():
+        var sender_id = multiplayer.get_remote_sender_id()
+        if sender_id != 0:
+            var sender_team = NetworkManager.player_teams.get(sender_id, -1)
+            if sender_team != TurnManager.current_team:
+                push_warning("⚠️ Fin de tour rejetée: Pas le tour de %d" % sender_id)
+                return
+    
+    EventBus.end_turn_requested.emit()
+
+
+## Validation anti-triche côté serveur
+func _validate_action(sender_peer_id: int, unit: UnitBase) -> bool:
+    # Vérifier que le joueur contrôle bien cette équipe
+    var sender_team = NetworkManager.player_teams.get(sender_peer_id, -1)
+    if sender_team != unit.team_index:
+        return false
+    
+    # Vérifier que c'est bien le tour de cette équipe
+    if unit.team_index != TurnManager.current_team:
+        return false
+    
+    return true
+```
+
+**Modification des appels (remplacer les anciens) :**
+```gdscript
+# ═══════════════════════════════════════════════════════════════════════════
+# AVANT (appel direct - NE FONCTIONNE PAS EN RÉSEAU):
+# EventBus.move_requested.emit(selected_unit, target_cell)
+#
+# APRÈS (appel RPC - SYNCHRONISÉ SUR TOUS LES CLIENTS):
+# rpc_request_move.rpc(selected_unit.get_path(), target_cell.x, target_cell.y)
+# ═══════════════════════════════════════════════════════════════════════════
+
+func _execute_move_action(target_cell: Vector2i) -> void:
+    if not selected_unit:
+        return
+    
+    # Vérification locale (feedback immédiat)
+    if not GridManager.is_cell_reachable(selected_unit, target_cell):
+        print("❌ Case non atteignable")
+        return
+    
+    # APPEL RPC → Synchronisé sur tous les clients
+    rpc_request_move.rpc(selected_unit.get_path(), target_cell.x, target_cell.y)
+    
+    _deselect_unit()
+
+
+func _execute_attack_action(target_unit: UnitBase) -> void:
+    if not selected_unit:
+        return
+    
+    # Vérification locale
+    if not _can_attack(selected_unit, target_unit):
+        print("❌ Attaque impossible")
+        return
+    
+    # APPEL RPC → Synchronisé
+    rpc_request_attack.rpc(selected_unit.get_path(), target_unit.get_path())
+    
+    _deselect_unit()
+
+
+func _execute_ability_action(ability_id: String, target_cell: Vector2i) -> void:
+    if not selected_unit:
+        return
+    
+    # APPEL RPC → Synchronisé
+    rpc_request_ability.rpc(selected_unit.get_path(), ability_id, target_cell.x, target_cell.y)
+    
+    _deselect_unit()
+
+
+func _on_end_turn_pressed() -> void:
+    # APPEL RPC → Tout le monde change de tour en même temps
+    rpc_end_turn.rpc()
+```
+
+---
+
+### 🎯 Tâche 4 : Synchronisation du Tour (turn_manager.gd)
+
+**Fichier :** `res://autoload/turn_manager.gd`
+
+**Le TurnManager doit réagir aux signaux, pas les générer directement :**
+```gdscript
+# ═══════════════════════════════════════════════════════════════════════════
+# IMPORTANT: Le changement de tour est déclenché par RPC depuis PlayerController
+# Pas d'appel direct à next_turn() depuis l'UI ou autre
+# ═══════════════════════════════════════════════════════════════════════════
+
+func _ready():
+    # Écouter le signal de fin de tour (émis par RPC)
+    EventBus.end_turn_requested.connect(_on_end_turn_requested)
+
+func _on_end_turn_requested():
+    # Cette fonction est appelée sur TOUS les clients via RPC
+    _advance_turn()
+
+func _advance_turn():
+    # Réinitialiser PA des unités de l'équipe qui vient de jouer
+    _reset_team_ap(current_team)
+    
+    # Passer à l'équipe suivante
+    current_team = (current_team + 1) % total_teams
+    turn_count += 1
+    
+    print("🔄 Tour %d - Équipe %d" % [turn_count, current_team])
+    
+    # Émettre le signal pour l'UI et autres systèmes
+    EventBus.turn_changed.emit(current_team, turn_count)
+    
+    # Vérifier conditions de victoire
+    _check_victory_conditions()
+
+func _reset_team_ap(team_index: int):
+    for unit in get_tree().get_nodes_in_group("units"):
+        if unit.team_index == team_index:
+            unit.reset_ap()
+```
+
+---
+
+### 🎯 Tâche 5 : Synchronisation des Dégâts/Morts (combat_system.gd)
+
+**Si tu as un système de combat séparé, il doit aussi être synchronisé :**
+```gdscript
+# res://scripts/systems/combat_system.gd
+
+## Applique les dégâts - DOIT être appelé via RPC pour être synchronisé
+func apply_damage(target: UnitBase, amount: int, source: UnitBase = null) -> void:
+    target.current_hp -= amount
+    
+    print("💥 %s subit %d dégâts (HP: %d/%d)" % [
+        target.name, amount, target.current_hp, target.stats.max_hp
+    ])
+    
+    EventBus.unit_damaged.emit(target, amount, source)
+    
+    if target.current_hp <= 0:
+        _handle_death(target, source)
+
+func _handle_death(unit: UnitBase, killer: UnitBase = null) -> void:
+    print("💀 %s est mort!" % unit.name)
+    
+    EventBus.unit_died.emit(unit, killer)
+    
+    # Vérifier si c'était le Leader
+    if unit.is_leader:
+        var losing_team = unit.team_index
+        var winning_team = 1 - losing_team  # Assuming 2 teams
+        EventBus.game_over.emit(winning_team, "leader_killed")
+```
+
+---
+
+### 🧪 Tests et Debugging
+
+**Configuration Debug (2 instances) :**
+1. Dans Godot : `Debug → Run Multiple Instances → 2`
+2. Ou lancer 2 exports séparément
+
+**Checklist de test :**
+```
+[ ] Instance 1: Cliquer "Host"
+    → Affiche "En attente..."
+    → my_player_id = 1
+    → player_teams = {1: 0}
+
+[ ] Instance 2: Entrer 127.0.0.1, cliquer "Join"
+    → Les deux passent à la scène de jeu
+    → my_player_id = [unique_id]
+    → player_teams = {1: 0, [id]: 1}
+
+[ ] Host bouge une unité Team 0
+    → L'unité bouge sur LES DEUX écrans
+
+[ ] Client essaie de bouger une unité Team 0
+    → RIEN ne se passe (pas son tour)
+
+[ ] Client bouge une unité Team 1 (après End Turn du Host)
+    → L'unité bouge sur LES DEUX écrans
+
+[ ] Host essaie de bouger pendant le tour du Client
+    → RIEN ne se passe
+
+[ ] Attaque → Dégâts visibles sur les deux écrans
+[ ] Mort d'unité → Disparaît sur les deux écrans
+[ ] Leader meurt → Game Over sur les deux écrans
+```
+
+**Debug prints utiles :**
+```gdscript
+# Dans NetworkManager
+print("🔍 my_player_id: %d" % my_player_id)
+print("🔍 player_teams: %s" % str(player_teams))
+print("🔍 is_my_turn(%d): %s" % [TurnManager.current_team, is_my_turn(TurnManager.current_team)])
+
+# Dans PlayerController (début de _unhandled_input)
+print("🎮 Input reçu - Mon tour: %s" % NetworkManager.is_my_turn(TurnManager.current_team))
+```
+
+---
+
+### ⚠️ Pièges Courants
+
+| Piège | Solution |
+|-------|----------|
+| `rpc()` sans `.rpc()` | Toujours appeler `fonction.rpc()` pas `fonction()` |
+| NodePath invalide après changement de scène | Utiliser des IDs uniques ou recalculer les paths |
+| Désync des HP | Tous les dégâts doivent passer par RPC |
+| Turn_manager appelé 2 fois | Un seul point d'entrée via EventBus |
+| Client qui triche | TOUJOURS valider côté serveur (Host) |
+| Vector2i en paramètre RPC | Godot ne sérialise pas Vector2i → Utiliser int x, int y |
+
+---
+
+### 📁 Résumé des Fichiers à Modifier
+
+| Fichier | Modifications |
+|---------|---------------|
+| `network_manager.gd` | + `my_player_id`, `player_teams`, `is_my_turn()`, `is_my_unit()`, `_sync_teams()` |
+| `player_controller.gd` | + Guard clauses, + 4 fonctions RPC, modifier les appels d'action |
+| `turn_manager.gd` | Écouter `end_turn_requested`, synchroniser `_advance_turn()` |
+| `combat_system.gd` | S'assurer que `apply_damage` est appelé via la chaîne RPC |
+
+---
+
+### 🔄 Flux de Données Réseau (Complet)
 
 ```
 [CLIENT clique "Move"]
        │
        ▼
-[request_move_rpc.rpc_id(1, ...)]  ───► [SERVEUR reçoit]
-                                              │
-                                              ▼
-                                        [Validation]
-                                        - Mon unité ?
-                                        - Mon tour ?
-                                        - Case valide ?
-                                              │
-                                              ▼
-                                        [execute_move.rpc()]
-                                              │
-                                    ┌─────────┴─────────┐
-                                    ▼                   ▼
-                              [CLIENT voit]       [HOST voit]
-                              l'unité bouger      l'unité bouger
+[Guard: is_my_turn?] ──NO──► return
+       │
+       │ YES
+       ▼
+[Guard: is_my_unit?] ──NO──► return
+       │
+       │ YES
+       ▼
+[rpc_request_move.rpc(...)]
+       │
+       ├──────────────────────────────────┐
+       │                                  │
+       ▼                                  ▼
+[CLIENT exécute]                    [HOST reçoit]
+(call_local)                              │
+       │                                  ▼
+       │                          [Validation serveur]
+       │                          - sender owns unit?
+       │                          - correct turn?
+       │                                  │
+       │                           ┌──────┴──────┐
+       │                           │ VALID       │ INVALID
+       │                           ▼             ▼
+       │                    [Exécute +         [return]
+       │                     log/broadcast]
+       │                           │
+       ▼                           ▼
+[EventBus.move_requested]   [EventBus.move_requested]
+       │                           │
+       ▼                           ▼
+[Unit.move_to()]            [Unit.move_to()]
+       │                           │
+       ▼                           ▼
+[Visuel CLIENT]             [Visuel HOST]
+    (synchronisé!)              (synchronisé!)
 ```
 
 ---
