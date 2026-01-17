@@ -618,6 +618,326 @@ func _decide_action(unit: UnitBase, board: GameBoard) -> Dictionary:
 
 ---
 
+## 🌐 MULTIJOUEUR EN LIGNE (PvP)
+
+### 🎯 Modes de Jeu Supportés
+| Mode | Description | Statut |
+|------|-------------|--------|
+| **Hotseat** | 2 joueurs, même écran | ✅ Déjà fonctionnel |
+| **En Ligne** | 2 joueurs, via Internet | 🔄 À implémenter |
+
+### 🏗️ Architecture Réseau : "Authoritative Server"
+
+```
+┌─────────────────────┐         ┌─────────────────────┐
+│   JOUEUR 1 (HOST)   │◄───────►│   JOUEUR 2 (CLIENT) │
+│   ID = 1            │  ENet   │   ID = auto         │
+│   Team 0            │         │   Team 1            │
+│   ══════════════    │         │                     │
+│   SERVEUR LOGIQUE   │         │   Envoie intentions │
+│   (valide tout)     │         │   Reçoit résultats  │
+└─────────────────────┘         └─────────────────────┘
+```
+
+**Principe :** Le Host (Serveur) valide toutes les actions. Le Client envoie des "intentions", jamais d'exécutions directes.
+
+---
+
+### 📁 Nouveaux Fichiers Requis
+
+```
+res://
+├── scripts/
+│   ├── core/
+│   │   └── network_manager.gd    # Autoload - Gestion connexion
+│   └── controllers/
+│       └── player_controller.gd  # Modifié pour réseau
+├── ui/
+│   └── lobby_ui.gd               # Menu Host/Join
+└── scenes/
+    └── lobby.tscn                # Scène de connexion
+```
+
+---
+
+### 🔧 Étape 1 : Network Manager (Autoload)
+
+```gdscript
+# res://scripts/core/network_manager.gd
+extends Node
+
+signal player_connected(id: int)
+signal player_disconnected(id: int)
+signal connection_failed
+signal server_started
+signal connected_to_server
+
+const DEFAULT_PORT = 7777
+const MAX_PLAYERS = 2
+
+var peer: ENetMultiplayerPeer
+var player_info: Dictionary = {}  # {id: {name, team}}
+
+func _ready():
+    multiplayer.peer_connected.connect(_on_peer_connected)
+    multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+    multiplayer.connected_to_server.connect(_on_connected_to_server)
+    multiplayer.connection_failed.connect(_on_connection_failed)
+
+# === HOST (Serveur) ===
+func host_game(player_name: String = "Host") -> Error:
+    peer = ENetMultiplayerPeer.new()
+    var error = peer.create_server(DEFAULT_PORT, MAX_PLAYERS)
+    if error != OK:
+        return error
+    
+    multiplayer.multiplayer_peer = peer
+    player_info[1] = {name = player_name, team = 0}
+    server_started.emit()
+    print("🖥️ Serveur démarré sur le port %d" % DEFAULT_PORT)
+    return OK
+
+# === CLIENT (Rejoindre) ===
+func join_game(ip: String, player_name: String = "Client") -> Error:
+    peer = ENetMultiplayerPeer.new()
+    var error = peer.create_client(ip, DEFAULT_PORT)
+    if error != OK:
+        return error
+    
+    multiplayer.multiplayer_peer = peer
+    return OK
+
+# === Callbacks ===
+func _on_peer_connected(id: int):
+    print("👤 Joueur connecté: %d" % id)
+    if multiplayer.is_server():
+        # Assigner Team 1 au client
+        player_info[id] = {name = "Player_%d" % id, team = 1}
+        _sync_player_info.rpc()
+    player_connected.emit(id)
+
+func _on_peer_disconnected(id: int):
+    print("👤 Joueur déconnecté: %d" % id)
+    player_info.erase(id)
+    player_disconnected.emit(id)
+
+func _on_connected_to_server():
+    print("✅ Connecté au serveur!")
+    connected_to_server.emit()
+
+func _on_connection_failed():
+    print("❌ Échec de connexion")
+    connection_failed.emit()
+
+@rpc("authority", "call_local", "reliable")
+func _sync_player_info():
+    # Synchroniser les infos joueurs sur tous les clients
+    pass
+
+func get_my_team() -> int:
+    return player_info.get(multiplayer.get_unique_id(), {}).get("team", -1)
+
+func is_my_turn(current_team: int) -> bool:
+    return get_my_team() == current_team
+```
+
+---
+
+### 🔧 Étape 2 : Lobby UI
+
+```gdscript
+# res://scripts/ui/lobby_ui.gd
+extends Control
+
+@onready var host_btn: Button = $VBox/HostButton
+@onready var join_btn: Button = $VBox/JoinButton
+@onready var ip_input: LineEdit = $VBox/IPInput
+@onready var status_label: Label = $VBox/StatusLabel
+
+func _ready():
+    host_btn.pressed.connect(_on_host_pressed)
+    join_btn.pressed.connect(_on_join_pressed)
+    
+    NetworkManager.server_started.connect(_on_server_started)
+    NetworkManager.connected_to_server.connect(_on_connected)
+    NetworkManager.player_connected.connect(_on_player_joined)
+    NetworkManager.connection_failed.connect(_on_failed)
+
+func _on_host_pressed():
+    status_label.text = "Création du serveur..."
+    var error = NetworkManager.host_game()
+    if error != OK:
+        status_label.text = "Erreur: %s" % error
+
+func _on_join_pressed():
+    var ip = ip_input.text if ip_input.text else "127.0.0.1"
+    status_label.text = "Connexion à %s..." % ip
+    var error = NetworkManager.join_game(ip)
+    if error != OK:
+        status_label.text = "Erreur: %s" % error
+
+func _on_server_started():
+    status_label.text = "🖥️ En attente d'un joueur..."
+
+func _on_connected():
+    status_label.text = "✅ Connecté! Chargement..."
+    _start_game()
+
+func _on_player_joined(id: int):
+    if multiplayer.is_server() and NetworkManager.player_info.size() >= 2:
+        status_label.text = "✅ Partie complète! Démarrage..."
+        _start_game.rpc()
+
+func _on_failed():
+    status_label.text = "❌ Échec de connexion"
+
+@rpc("authority", "call_local", "reliable")
+func _start_game():
+    get_tree().change_scene_to_file("res://scenes/main.tscn")
+```
+
+---
+
+### 🔧 Étape 3 : Ownership des Unités
+
+```gdscript
+# res://scripts/units/unit_base.gd - AJOUTS
+var owner_peer_id: int = 1  # Par défaut: le host
+
+func _ready():
+    # ... code existant ...
+    
+    # Configurer l'autorité réseau
+    set_multiplayer_authority(owner_peer_id)
+
+func is_owned_by_local_player() -> bool:
+    return multiplayer.get_unique_id() == owner_peer_id
+```
+
+---
+
+### 🔧 Étape 4 : Filtrage des Inputs (CRITIQUE)
+
+```gdscript
+# res://scripts/controllers/player_controller.gd - MODIFICATIONS
+
+var my_team: int = -1
+
+func _ready():
+    # ... code existant ...
+    
+    # Récupérer ma team depuis le NetworkManager
+    if multiplayer.has_multiplayer_peer():
+        my_team = NetworkManager.get_my_team()
+
+func _unhandled_input(event: InputEvent) -> void:
+    # === VÉRIFICATION RÉSEAU ===
+    if multiplayer.has_multiplayer_peer():
+        # Vérifier si c'est mon tour
+        if not NetworkManager.is_my_turn(TurnManager.current_team):
+            return
+    
+    # ... reste du code input ...
+```
+
+---
+
+### 🔧 Étape 5 : Synchronisation RPC
+
+```gdscript
+# res://scripts/controllers/player_controller.gd - AJOUTS RPC
+
+# Quand je veux bouger une unité
+func _request_move(unit: UnitBase, target_cell: Vector2i):
+    if multiplayer.is_server():
+        # Je suis le serveur, j'exécute direct
+        _execute_move(unit.get_path(), target_cell)
+    else:
+        # Je suis client, j'envoie au serveur
+        _request_move_rpc.rpc_id(1, unit.get_path(), target_cell)
+
+@rpc("any_peer", "reliable")
+func _request_move_rpc(unit_path: NodePath, target_cell: Vector2i):
+    # Serveur reçoit la demande
+    if not multiplayer.is_server():
+        return
+    
+    var unit = get_node_or_null(unit_path) as UnitBase
+    if not unit:
+        return
+    
+    # === ANTI-TRICHE ===
+    var sender_id = multiplayer.get_remote_sender_id()
+    if unit.owner_peer_id != sender_id:
+        print("⚠️ Triche détectée: %d essaie de bouger l'unité de %d" % [sender_id, unit.owner_peer_id])
+        return
+    
+    # Valide le mouvement
+    if not _is_valid_move(unit, target_cell):
+        return
+    
+    # Exécute sur tous les clients
+    _execute_move.rpc(unit_path, target_cell)
+
+@rpc("authority", "call_local", "reliable")
+func _execute_move(unit_path: NodePath, target_cell: Vector2i):
+    var unit = get_node(unit_path) as UnitBase
+    unit.move_to(target_cell)
+```
+
+---
+
+### ✅ Checklist Multijoueur
+
+#### Configuration Projet
+- [ ] `NetworkManager` ajouté aux Autoloads
+- [ ] `lobby.tscn` créée avec les boutons Host/Join
+- [ ] `main.tscn` chargée via Lobby (pas en démarrage direct)
+
+#### Tests Connexion
+- [ ] Host démarre → "En attente..."
+- [ ] Client rejoint (127.0.0.1) → Les deux passent à Main
+- [ ] Déconnexion gérée proprement
+
+#### Tests Gameplay
+- [ ] Joueur 1 ne peut bouger que Team 0
+- [ ] Joueur 2 ne peut bouger que Team 1
+- [ ] Les mouvements sont synchronisés
+- [ ] Les attaques/dégâts sont synchronisés
+- [ ] Game Over affiché sur les deux écrans
+
+#### Anti-Triche
+- [ ] Impossible de bouger une unité adverse
+- [ ] Impossible de jouer hors de son tour
+- [ ] Serveur valide toutes les actions
+
+---
+
+### 🔄 Flux de Données Réseau
+
+```
+[CLIENT clique "Move"]
+       │
+       ▼
+[request_move_rpc.rpc_id(1, ...)]  ───► [SERVEUR reçoit]
+                                              │
+                                              ▼
+                                        [Validation]
+                                        - Mon unité ?
+                                        - Mon tour ?
+                                        - Case valide ?
+                                              │
+                                              ▼
+                                        [execute_move.rpc()]
+                                              │
+                                    ┌─────────┴─────────┐
+                                    ▼                   ▼
+                              [CLIENT voit]       [HOST voit]
+                              l'unité bouger      l'unité bouger
+```
+
+---
+
 ## 🎭 Peuples et Compétences (PROCHAINE ÉTAPE)
 
 ### Peuples Prévus
@@ -628,6 +948,656 @@ func _decide_action(unit: UnitBase, board: GameBoard) -> Dictionary:
 | 🌿 Nature | Terrain | Regen en forêt | Mur de ronces |
 | ⚡ Foudre | Mobilité | Vitesse +1 | Téléportation |
 | 🪨 Terre | Défense | Armure +2 | Mur de pierre |
+
+---
+
+## 🌐 Backend Multijoueur Online (À IMPLÉMENTER)
+
+> **Référence :** Architecture inspirée du backend LIM Truco Game Server (REST + WebSocket).
+> **Objectif :** Serveur Python FastAPI autoritaire pour matchs PvP online.
+
+---
+
+### 🏗️ Architecture Cible
+
+```
+server/
+├── app/
+│   ├── __init__.py              # Package init, version
+│   ├── main.py                  # FastAPI app, routes, lifespan
+│   ├── models.py                # Pydantic models (request/response)
+│   ├── game_logic.py            # Champions, abilities, damage calc, victory
+│   ├── actions.py               # Action processors (move, attack, ability)
+│   └── websocket_manager.py     # Connection pool, broadcast
+├── requirements.txt             # fastapi, uvicorn, pydantic, websockets
+├── Dockerfile                   # Python 3.11-slim
+├── docker-compose.yml           # Service + optional Redis
+└── README.md                    # Setup instructions
+```
+
+---
+
+### 🔐 Authentification
+
+**Méthode :** API Key dans header `X-API-Key`
+
+```http
+# HTTP Requests
+X-API-Key: your-api-key-here
+
+# WebSocket
+ws://server/ws/matches/{matchId}?slot=0&api_key=your-api-key
+```
+
+**Validation :**
+```python
+API_KEYS = {"dev-key-12345", "godot-client-key"}
+
+def verify_api_key(x_api_key: str = Header(None)):
+    if x_api_key not in API_KEYS:
+        raise HTTPException(401, {"errorCode": "UNAUTHORIZED"})
+```
+
+---
+
+### 📡 API Endpoints Détaillés
+
+#### Health (No Auth)
+
+```http
+GET /status/health
+Response 200:
+{
+  "status": "ok",
+  "uptimeMs": 123456,
+  "activeMatches": 5,
+  "connectedPlayers": 10
+}
+```
+
+#### Debug (Auth Required)
+
+```http
+GET /status/debug
+Response 200:
+{
+  "lobbies": {...},
+  "matches": {...},
+  "totalLobbies": 5,
+  "totalMatches": 3
+}
+```
+
+---
+
+#### Lobby Management
+
+**POST /lobbies** - Créer un lobby
+```json
+// Request
+{
+  "displayName": "Alice",
+  "team": "fire",
+  "champions": ["mage_fire", "warrior_fire", "assassin_fire"]
+}
+
+// Response 201
+{
+  "lobbyId": "uuid-here",
+  "playerSlot": 0,
+  "state": "waiting",
+  "inviteCode": "ABCD1234"
+}
+```
+
+**GET /lobbies/{lobbyId}** - État du lobby
+```json
+// Response 200
+{
+  "lobbyId": "uuid",
+  "players": [
+    {"slot": 0, "name": "Alice", "team": "fire", "champions": [...], "ready": true},
+    {"slot": 1, "name": "Bob", "team": "earth", "champions": [...], "ready": false}
+  ],
+  "state": "waiting|ready|started",
+  "matchId": null,
+  "inviteCode": "ABCD1234"
+}
+```
+
+**POST /lobbies/{lobbyId}/join** - Rejoindre
+```json
+// Request
+{
+  "displayName": "Bob",
+  "team": "earth",
+  "champions": ["tank_earth", "guardian_earth", "mage_earth"]
+}
+```
+
+**POST /lobbies/{lobbyId}/ready** - Toggle ready
+```json
+// Request
+{"slot": 0, "ready": true}
+```
+
+**POST /lobbies/{lobbyId}/start** - Démarrer (tous ready)
+```json
+// Response 201
+{"matchId": "match-uuid"}
+```
+
+**DELETE /lobbies/{lobbyId}** - Supprimer lobby
+```
+Response 204 No Content
+```
+
+---
+
+#### Match Management
+
+**POST /matches** - Créer match direct (bypass lobby)
+```json
+// Request
+{
+  "playerA": {
+    "name": "Alice",
+    "team": "fire",
+    "champions": ["mage_fire", "warrior_fire"]
+  },
+  "playerB": {
+    "name": "Bob",
+    "team": "earth",
+    "champions": ["tank_earth", "guardian_earth"]
+  },
+  "gridSize": {"width": 10, "height": 10},
+  "obstacles": [[4, 4], [4, 5], [4, 6]]
+}
+
+// Response 201
+{
+  "matchId": "uuid",
+  "initialState": {
+    "matchId": "uuid",
+    "status": "active",
+    "turn": 1,
+    "currentTeam": 0,
+    "grid": {"width": 10, "height": 10, "obstacles": [...]},
+    "units": [
+      {
+        "id": "unit-abc123",
+        "ownerId": 0,
+        "championType": "mage_fire",
+        "position": [1, 2],
+        "currentHp": 8,
+        "maxHp": 8,
+        "currentAp": 3,
+        "maxAp": 3,
+        "moveRange": 3,
+        "attackRange": 2,
+        "attack": 4,
+        "defense": 0,
+        "isLeader": true,
+        "abilities": ["fireball"],
+        "status": []
+      }
+    ],
+    "scores": [0, 0]
+  }
+}
+```
+
+**GET /matches/{matchId}** - État actuel
+```json
+// Response 200
+{
+  "matchId": "uuid",
+  "status": "active|finished|abandoned",
+  "turn": 5,
+  "currentTeam": 1,
+  "grid": {...},
+  "units": [...],
+  "scores": [2, 1],
+  "lastAction": {
+    "type": "move",
+    "actorSlot": 0,
+    "unitId": "unit-1",
+    "timestamp": "2026-01-17T10:30:00Z"
+  }
+}
+```
+
+**POST /matches/{matchId}/forfeit** - Abandonner
+```json
+// Request
+{"actorSlot": 1}
+
+// Response 200
+{"winnerSlot": 0, "reason": "forfeit"}
+```
+
+**GET /matches/{matchId}/log** - Journal des actions
+```json
+// Response 200
+{
+  "events": [
+    {"timestamp": "...", "type": "matchStarted"},
+    {"timestamp": "...", "type": "unitMoved", "payload": {...}},
+    {"timestamp": "...", "type": "abilityUsed", "payload": {...}}
+  ]
+}
+```
+
+---
+
+#### Game Actions
+
+**POST /matches/{matchId}/actions**
+
+| Action | Type | Payload | Coût AP |
+|--------|------|---------|---------|
+| Déplacer | `move` | `{unitId, to: [x,y]}` | 1/case (Manhattan) |
+| Attaquer | `attack` | `{unitId, targetId}` | 1 |
+| Compétence | `ability` | `{unitId, abilityId, target: [x,y]}` | Variable |
+| Fin tour | `endTurn` | `{}` | 0 |
+| Passer | `skip` | `{unitId}` | 0 |
+
+**Move Action:**
+```json
+{
+  "actorSlot": 0,
+  "type": "move",
+  "payload": {"unitId": "unit-1", "to": [3, 4]}
+}
+
+// Response 202
+{
+  "applied": true,
+  "newState": {...},
+  "events": [
+    {"type": "unitMoved", "unitId": "unit-1", "from": [1,1], "to": [3,4], "path": [[2,1],[2,2],[3,3],[3,4]]},
+    {"type": "apConsumed", "unitId": "unit-1", "amount": 4, "remaining": 0}
+  ]
+}
+```
+
+**Attack Action:**
+```json
+{
+  "actorSlot": 0,
+  "type": "attack",
+  "payload": {"unitId": "unit-1", "targetId": "unit-5"}
+}
+
+// Response 202
+{
+  "applied": true,
+  "events": [
+    {"type": "unitAttacked", "attackerId": "unit-1", "targetId": "unit-5", "baseDamage": 4, "actualDamage": 3, "shieldAbsorbed": 0},
+    {"type": "apConsumed", "unitId": "unit-1", "amount": 1},
+    {"type": "unitDied", "unitId": "unit-5", "isLeader": true, "killedBy": "unit-1"},
+    {"type": "gameOver", "winner": 0, "reason": "leaderKilled", "finalScores": [3, 0]}
+  ]
+}
+```
+
+**Ability Action:**
+```json
+{
+  "actorSlot": 0,
+  "type": "ability",
+  "payload": {"unitId": "unit-1", "abilityId": "fireball", "target": [5, 5]}
+}
+
+// Response 202
+{
+  "applied": true,
+  "events": [
+    {
+      "type": "abilityUsed",
+      "casterId": "unit-1",
+      "abilityId": "fireball",
+      "targetCells": [[5,5], [4,5], [6,5], [5,4], [5,6]],
+      "affectedUnits": [
+        {"unitId": "unit-5", "damage": 4, "newHp": 6},
+        {"unitId": "unit-6", "damage": 4, "newHp": 0}
+      ]
+    },
+    {"type": "unitDied", "unitId": "unit-6", "isLeader": false}
+  ]
+}
+```
+
+**End Turn Action:**
+```json
+{
+  "actorSlot": 0,
+  "type": "endTurn",
+  "payload": {}
+}
+
+// Response 202
+{
+  "events": [
+    {"type": "turnEnded", "team": 0},
+    {"type": "statusDamage", "unitId": "unit-3", "status": "burning", "damage": 2},
+    {"type": "statusExpired", "unitId": "unit-4", "status": "slowed"},
+    {"type": "turnStarted", "turn": 6, "team": 1, "unitsReset": ["unit-5", "unit-6"]}
+  ]
+}
+```
+
+---
+
+### 🔌 WebSocket Protocol
+
+**Connection:**
+```
+ws://localhost:8080/ws/matches/{matchId}?slot=0&api_key=your-key
+```
+
+**Close Codes:**
+| Code | Raison |
+|------|--------|
+| 4000 | Match invalide |
+| 4001 | Slot invalide |
+| 4002 | Trop de connexions |
+| 4003 | API key invalide |
+| 4004 | Match terminé |
+
+**Server → Client Messages:**
+
+```json
+// State Update (full state on connect + after each action)
+{"kind": "stateUpdate", "payload": {/* full match state */}}
+
+// Unit Event
+{"kind": "unitEvent", "payload": {
+  "type": "unitMoved|unitAttacked|unitDied|unitTeleported",
+  ...
+}}
+
+// Ability Event
+{"kind": "abilityEvent", "payload": {
+  "abilityId": "fireball",
+  "casterId": "unit-1",
+  "targetCells": [[5,5], ...],
+  "affectedUnits": [...],
+  "damage": 4
+}}
+
+// Turn Event
+{"kind": "turnEvent", "payload": {
+  "type": "turnStart|turnEnd",
+  "turn": 6,
+  "activeTeam": 0,
+  "unitsReset": ["unit-1", "unit-2"]
+}}
+
+// Status Event
+{"kind": "statusEvent", "payload": {
+  "type": "statusApplied|statusExpired|statusDamage",
+  "unitId": "unit-3",
+  "status": "burning",
+  "damage": 2
+}}
+
+// Game Over
+{"kind": "gameOver", "payload": {
+  "winner": 0,
+  "reason": "leaderKilled|teamWipe|forfeit|timeout",
+  "finalScores": [5, 2]
+}}
+```
+
+---
+
+### 🎮 Game Logic
+
+#### Champions (par Team)
+
+**🔥 Fire Team:**
+| Champion | HP | AP | Move | Range | ATK | DEF | Abilities |
+|----------|----|----|------|-------|-----|-----|-----------|
+| mage_fire | 8 | 3 | 3 | 2 | 4 | 0 | fireball |
+| warrior_fire | 12 | 3 | 4 | 1 | 3 | 1 | charge |
+| assassin_fire | 6 | 4 | 5 | 1 | 5 | 0 | ignite |
+
+**🪨 Earth Team:**
+| Champion | HP | AP | Move | Range | ATK | DEF | Abilities |
+|----------|----|----|------|-------|-----|-----|-----------|
+| tank_earth | 16 | 2 | 2 | 1 | 2 | 3 | wall |
+| guardian_earth | 12 | 3 | 3 | 1 | 2 | 2 | shield |
+| mage_earth | 8 | 3 | 3 | 3 | 3 | 1 | earthquake |
+
+**⏰ Time Team:**
+| Champion | HP | AP | Move | Range | ATK | DEF | Abilities |
+|----------|----|----|------|-------|-----|-----|-----------|
+| oracle_time | 8 | 4 | 3 | 2 | 2 | 0 | rewind |
+| chrono_time | 10 | 3 | 4 | 1 | 3 | 1 | slow |
+| sage_time | 6 | 3 | 3 | 3 | 3 | 0 | hasten |
+
+**⚡ Lightning Team:**
+| Champion | HP | AP | Move | Range | ATK | DEF | Abilities |
+|----------|----|----|------|-------|-----|-----|-----------|
+| assassin_lightning | 7 | 4 | 5 | 1 | 4 | 0 | teleport |
+| storm_lightning | 9 | 3 | 4 | 2 | 3 | 1 | chain_lightning |
+| flash_lightning | 8 | 4 | 6 | 1 | 2 | 0 | dash |
+
+**🌿 Nature Team:**
+| Champion | HP | AP | Move | Range | ATK | DEF | Abilities |
+|----------|----|----|------|-------|-----|-----|-----------|
+| druid_nature | 10 | 3 | 3 | 2 | 2 | 1 | heal |
+| treant_nature | 14 | 2 | 2 | 1 | 3 | 2 | root |
+| ranger_nature | 8 | 3 | 4 | 4 | 3 | 0 | poison_arrow |
+
+#### Abilities
+
+| Ability | Cost | Range | Pattern | Effect |
+|---------|------|-------|---------|--------|
+| fireball | 2 | 5 | cross (5 cells) | 4 damage AOE |
+| charge | 2 | 3 | line | Dash + 3 damage |
+| ignite | 1 | 1 | single | 2 dmg + burning (2/turn) |
+| wall | 2 | 4 | line_3 | Create 3 obstacles (3 turns) |
+| shield | 1 | 2 | single | Absorb 4 damage |
+| earthquake | 3 | 4 | diamond_5 | 3 damage large AOE |
+| rewind | 3 | 3 | single | Teleport ally back + heal 3 |
+| slow | 1 | 3 | single | -1 Move (2 turns) |
+| hasten | 1 | 2 | single | +1 AP this turn |
+| teleport | 2 | 6 | point | Instant teleport |
+| chain_lightning | 2 | 3 | chain_3 | 2 dmg bounces to 3 enemies |
+| dash | 1 | 4 | point | Free teleport move |
+| heal | 2 | 3 | cross | Heal allies 3 HP |
+| root | 2 | 3 | single | 1 dmg + stun (skip turn) |
+| poison_arrow | 1 | 5 | single | 2 dmg + poison (1/turn, 3 turns) |
+
+#### Status Effects
+
+| Status | Effect | Duration |
+|--------|--------|----------|
+| burning | -2 HP/turn | Until removed |
+| poisoned | -1 HP/turn | 3 turns |
+| slowed | -1 Move Range | 2 turns |
+| stunned | Skip next turn | 1 turn |
+| shielded | Absorb X damage | Until depleted |
+| hastened | +1 AP | This turn only |
+
+#### Victory Conditions
+
+| Condition | Trigger |
+|-----------|---------|
+| Leader Kill | Enemy Leader HP ≤ 0 |
+| Team Wipe | All enemy units dead |
+| Forfeit | Opponent surrenders |
+| Timeout | Most total HP wins |
+
+#### Damage Calculation
+
+```python
+actual_damage = max(1, attacker.attack - target.defense)
+
+# Shield check first
+if target.has_status("shielded"):
+    shield = target.get_shield_amount()
+    if shield >= actual_damage:
+        shield -= actual_damage
+        actual_damage = 0
+    else:
+        actual_damage -= shield
+        remove_shield()
+
+target.currentHp -= actual_damage
+```
+
+---
+
+### ❌ Error Handling
+
+**Error Response Format:**
+```json
+{
+  "errorCode": "ILLEGAL_MOVE",
+  "message": "Unit does not have enough AP",
+  "details": {"required": 3, "available": 1}
+}
+```
+
+**Error Codes:**
+| Code | HTTP | Description |
+|------|------|-------------|
+| UNAUTHORIZED | 401 | API key invalide |
+| BAD_REQUEST | 400 | Payload malformé |
+| NOT_FOUND | 404 | Ressource introuvable |
+| CONFLICT | 409 | État invalide (lobby plein, pas ton tour) |
+| GONE | 410 | Ressource expirée |
+| ILLEGAL_MOVE | 422 | Règle violée |
+| RATE_LIMITED | 429 | Trop de requêtes |
+| SERVER_ERROR | 500 | Erreur interne |
+
+**Illegal Move Reasons:**
+| Reason | Description |
+|--------|-------------|
+| NOT_YOUR_TURN | Ce n'est pas ton tour |
+| NOT_YOUR_UNIT | Unité adverse |
+| INSUFFICIENT_AP | PA insuffisants |
+| INVALID_TARGET | Cible invalide |
+| OUT_OF_RANGE | Hors de portée |
+| PATH_BLOCKED | Chemin bloqué |
+| CELL_OCCUPIED | Case occupée |
+| ON_COOLDOWN | Compétence en cooldown |
+| UNIT_DEAD | Unité morte |
+| UNIT_STUNNED | Unité étourdie |
+
+---
+
+### 🎯 Validation Rules (Server-Side)
+
+**Move Validation:**
+```
+1. match.status == "active"
+2. match.currentTeam == actorSlot
+3. unit exists && unit.ownerId == actorSlot
+4. unit.currentHp > 0
+5. unit not stunned
+6. distance(from, to) <= unit.moveRange
+7. unit.currentAp >= distance
+8. path exists (BFS, no obstacles/units blocking)
+9. destination not occupied
+```
+
+**Attack Validation:**
+```
+1. All move checks (1-5)
+2. unit.currentAp >= 1
+3. target exists && target.ownerId != actorSlot
+4. target.currentHp > 0
+5. distance(unit, target) <= unit.attackRange
+```
+
+**Ability Validation:**
+```
+1. All move checks (1-5)
+2. ability in unit.abilities
+3. ability not on cooldown
+4. unit.currentAp >= ability.cost
+5. distance(unit, target) <= ability.range
+6. (for teleport) destination not blocked
+```
+
+---
+
+### 🖥️ Godot Client Integration
+
+**Fichiers à créer dans Godot:**
+```
+res://scripts/network/
+├── api_client.gd        # HTTP client (lobbies, matches, actions)
+├── ws_client.gd         # WebSocket real-time
+└── network_manager.gd   # High-level wrapper + signals
+```
+
+**Signals NetworkManager:**
+```gdscript
+signal lobby_created(lobby_id, slot)
+signal lobby_joined(lobby_id, slot)
+signal lobby_updated(lobby)
+signal match_started(match_id, initial_state)
+signal match_state_changed(state)
+signal action_result(success, events)
+signal turn_changed(turn, active_team)
+signal unit_moved(unit_id, from, to)
+signal unit_attacked(attacker_id, target_id, damage)
+signal unit_died(unit_id, is_leader)
+signal ability_used(caster_id, ability_id, cells)
+signal game_ended(winner, reason)
+signal network_error(message)
+```
+
+**Flow Integration:**
+```
+1. UI: "Create Lobby" → NetworkManager.create_lobby()
+2. NetworkManager → HTTP POST /lobbies
+3. Response → emit lobby_created
+4. UI: Show invite code
+5. Opponent joins → HTTP POST /lobbies/{id}/join
+6. Both ready → HTTP POST /lobbies/{id}/start
+7. Start → Connect WebSocket
+8. Game loop: PlayerController.on_move() → NetworkManager.move()
+9. Server validates → WebSocket broadcasts state
+10. All clients sync
+```
+
+---
+
+### 📦 Deployment
+
+**Requirements:**
+```txt
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+websockets>=11.0
+```
+
+**Docker:**
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY app/ ./app/
+EXPOSE 8080
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+**Run:**
+```bash
+# Dev
+uvicorn app.main:app --reload --port 8080
+
+# Prod
+uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 4
+```
 
 ---
 
@@ -645,7 +1615,9 @@ func _decide_action(unit: UnitBase, board: GameBoard) -> Dictionary:
 2. 🔄 HUD & Game Over
 3. ⏳ Peuples (Data .tres)
 4. ⏳ Compétences uniques
-5. ⏳ IA basique
+5. ⏳ IA basique (si PvE)
+6. ⏳ Backend Multijoueur (spec ci-dessus)
+7. ⏳ Intégration Godot ↔ Backend
 ```
 
 ### Format de Réponse Préféré
