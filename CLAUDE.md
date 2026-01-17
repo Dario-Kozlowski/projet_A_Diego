@@ -4,6 +4,8 @@
 
 Jeu tactique au tour par tour en **Godot 4.5+** avec système de grille, gestion des PA (Points d'Action), et combat entre peuples aux pouvoirs uniques.
 
+**État actuel :** 16 fichiers créés, UI d'action en place, première compétence (Fireball) implémentée.
+
 ---
 
 ## 🏗️ Architecture du Squelette (COMPLÉTÉ)
@@ -17,9 +19,14 @@ res://
 │   ├── turn_manager.gd      # Gestion des tours (autoload)
 │   ├── player_controller.gd # Input joueur + sélection unités
 │   ├── unit_base.gd         # Classe de base des unités
-│   └── ability_base.gd      # Classe de base des compétences
+│   ├── ability_base.gd      # Classe de base des compétences
+│   ├── event_bus.gd         # Signaux globaux (autoload)
+│   └── abilities/
+│       └── ability_fireball.gd  # Première compétence
 ├── resources/
 │   └── unit_stats.gd        # Resource pour stats (PV, PA, Move)
+├── ui/
+│   └── action_ui.gd         # Menu d'actions (Move/Attack/End)
 └── scenes/
     ├── main.tscn
     └── unit.tscn
@@ -36,86 +43,120 @@ res://
 
 ---
 
-## ✅ Checklist de Validation (4 Tests)
+## 🚨 PHASE ACTUELLE : Intégration UI ↔ Gameplay
 
-Avant d'ajouter du contenu, vérifie ces mécaniques :
+### ⚠️ Piège à Éviter : "Spaghetti UI"
+L'UI ne doit **JAMAIS** modifier directement les PV ou PA. Elle envoie des **intentions** au Controller.
 
-### 1. Test des PA (Points d'Action)
-- [ ] Déplacement de 1 case = -1 PA
-- [ ] À 0 PA, impossible de bouger
-- [ ] Le label affiche correctement "AP: X"
-
-### 2. Test de la Boucle de Tour
-- [ ] Fin de tour → passe au joueur suivant
-- [ ] PA réinitialisés au début du tour
-- [ ] Impossible de contrôler l'unité adverse
-
-### 3. Test du Pathfinding (Murs)
-- [ ] L'unité contourne les obstacles
-- [ ] Pas de traversée en diagonale si bloqué
-- [ ] Distance maximale respectée (stat Move)
-
-### 4. Test des Collisions
-- [ ] Impossible de se déplacer sur une case occupée
-- [ ] OU déclenche une attaque (si implémenté)
-- [ ] Pas de superposition d'unités
-
----
-
-## 🔧 Ce Qui Reste à Implémenter
-
-### 1. Système de Combat de Base
-```gdscript
-# Dans unit_base.gd - à ajouter
-func attack(target: UnitBase) -> void:
-    var damage = stats.attack - target.stats.defense
-    target.take_damage(max(1, damage))
-    current_ap -= 1
+### Architecture de Communication
+```
+[ActionUI] --signal--> [EventBus] --signal--> [PlayerController] --appel--> [Unit]
 ```
 
-### 2. Condition de Victoire
+### États du PlayerController
 ```gdscript
-# Dans turn_manager.gd - à compléter
-func check_win_condition() -> void:
-    var team0_alive = units.filter(func(u): return u.team == 0 and u.is_alive())
-    var team1_alive = units.filter(func(u): return u.team == 1 and u.is_alive())
-    
-    if team0_alive.is_empty():
-        emit_signal("game_over", 1)  # Team 1 gagne
-    elif team1_alive.is_empty():
-        emit_signal("game_over", 0)  # Team 0 gagne
-```
-
-### 3. UI de Sélection d'Action
-```gdscript
-# Afficher les options quand une unité est sélectionnée
-# - Déplacer (Move)
-# - Attaquer (Attack) 
-# - Compétence Spéciale (Ability)
-# - Passer (End Turn)
+enum State {
+    STATE_IDLE,                    # Attente de sélection
+    STATE_UNIT_SELECTED,           # Unité sélectionnée, menu affiché
+    STATE_SELECTING_MOVE_DESTINATION,  # Clic pour destination
+    STATE_SELECTING_ATTACK_TARGET      # Clic pour cible
+}
 ```
 
 ---
 
-## 🎭 Peuples et Compétences (À CRÉER)
+## ✅ Checklist de Validation UI
 
-### Template pour un Peuple
+### 1. Indépendance de l'UI
+- [ ] ActionUI n'appelle **pas** `unit.attack()` directement
+- [ ] Les boutons émettent des signaux via EventBus
+- [ ] Exemple correct : `EventBus.action_selected.emit("attack")`
+
+### 2. Flux de Sélection
+- [ ] Clic sur unité alliée (avec PA) → UI apparaît
+- [ ] Clic dans le vide → UI disparaît
+- [ ] Clic sur ennemi → Rien (ou info)
+
+### 3. Flux d'Action
+- [ ] Bouton "Move" → Mode sélection destination
+- [ ] Bouton "Attack" → Mode sélection cible
+- [ ] Bouton "End Turn" → `TurnManager.end_turn()`
+
+### 4. Annulation
+- [ ] Clic droit / Echap → Annule l'action en cours
+- [ ] Retour à l'état `STATE_UNIT_SELECTED`
+
+---
+
+## 🔧 Code d'Intégration Requis
+
+### EventBus (autoload)
 ```gdscript
-# res://scripts/abilities/ability_[nom].gd
-extends AbilityBase
-class_name Ability[Nom]
+# res://scripts/event_bus.gd
+extends Node
 
-func _init():
-    ability_name = "Nom de la compétence"
-    ap_cost = 2
-    cooldown = 3
-    range_min = 1
-    range_max = 4
-
-func execute(caster: UnitBase, target) -> void:
-    # Logique de la compétence
-    emit_signal("execution_finished")
+signal unit_selected(unit: UnitBase)
+signal unit_deselected
+signal action_selected(action_name: String)
+signal action_cancelled
 ```
+
+### ActionUI - Signaux
+```gdscript
+# res://scripts/ui/action_ui.gd
+func _on_move_pressed():
+    EventBus.action_selected.emit("move")
+
+func _on_attack_pressed():
+    EventBus.action_selected.emit("attack")
+
+func _on_end_turn_pressed():
+    EventBus.action_selected.emit("end_turn")
+```
+
+### PlayerController - États
+```gdscript
+# res://scripts/controllers/player_controller.gd
+func _ready():
+    EventBus.action_selected.connect(_on_action_selected)
+
+func _on_action_selected(action: String):
+    match action:
+        "move":
+            current_state = State.STATE_SELECTING_MOVE_DESTINATION
+            action_ui.visible = false
+        "attack":
+            current_state = State.STATE_SELECTING_ATTACK_TARGET
+            action_ui.visible = false
+        "end_turn":
+            TurnManager.end_turn()
+
+func _input(event):
+    if event.is_action_pressed("ui_cancel"):  # Echap
+        _cancel_action()
+
+func _cancel_action():
+    current_state = State.STATE_UNIT_SELECTED
+    action_ui.visible = true
+    EventBus.action_cancelled.emit()
+```
+
+---
+
+## 🧪 Test d'Intégration (À faire manuellement)
+
+1. **Lance le jeu** (F5)
+2. **Clique sur ton Mage** → Le menu doit s'ouvrir
+3. **Clique sur "Move"** → Le menu se ferme
+4. **Clique sur une case** → L'unité bouge
+5. **Le menu réapparaît** (s'il reste des PA)
+6. **Appuie sur Echap** → Annule et réaffiche le menu
+
+✅ Si ça marche = **Tactical RPG fonctionnel !**
+
+---
+
+## 🎭 Peuples et Compétences (PROCHAINE ÉTAPE)
 
 ### Peuples Prévus
 | Peuple | Thème | Compétence Passive | Compétence Active |
@@ -133,16 +174,8 @@ func execute(caster: UnitBase, target) -> void:
 ### Comportement Attendu
 1. **Sois concis** - Réponds directement sans sur-expliquer
 2. **Code d'abord** - Génère le code, explique après si demandé
-3. **Respecte l'architecture** - Utilise les fichiers existants
-4. **Teste mentalement** - Vérifie les edge cases avant de proposer
-
-### Quand je demande "vérifie que tout marche"
-Réponds avec la **checklist des 4 tests** ci-dessus, pas un prompt de 50 lignes.
-
-### Quand je demande d'ajouter un peuple
-1. Crée le fichier `ability_[nom].gd`
-2. Crée la resource `[nom]_stats.tres`
-3. Montre comment l'instancier dans `main.gd`
+3. **Respecte l'architecture** - UI → EventBus → Controller → Unit
+4. **Jamais de spaghetti** - L'UI n'appelle jamais les unités directement
 
 ### Format de Réponse Préféré
 ```
@@ -156,10 +189,7 @@ Réponds avec la **checklist des 4 tests** ci-dessus, pas un prompt de 50 lignes
 ## 🚀 Commande de Lancement
 
 ```bash
-# Lancer le projet Godot
-godot --path /chemin/vers/projet
-
-# Ou dans l'éditeur : F5
+# Dans l'éditeur Godot : F5
 ```
 
 **Recherche dans le code :** `## FIX:` pour voir les corrections appliquées.
